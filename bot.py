@@ -2324,6 +2324,8 @@ async def process_telegram_signal(signal_doc, user_id: int, account_doc_id: str)
     async with signal_execution_lock:
         now = datetime.now(timezone.utc)
         entry_at = signal_doc.get("entry_at_utc")
+        if entry_at and entry_at.tzinfo is None:
+            entry_at = entry_at.replace(tzinfo=timezone.utc)
         if not entry_at or (now - entry_at).total_seconds() > 10:
             await signal_queue_db.update_one({"_id": signal_doc["_id"], "status": "processing"},
                 {"$set": {"status": "missed", "finished_at_utc": now, "reason": "Entry window expired"}})
