@@ -69,11 +69,43 @@ except Exception as e:
 # Load environment variables from a .env file
 load_dotenv()
 
-API_ID = int(os.getenv("API_ID", 12345678))  # Replace with a default value if needed
-API_HASH = os.getenv("API_HASH", "your_api_hash")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "your_bot_token")
-MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
-OWNER_ID = int(os.getenv("OWNER_ID", 987654321))  # Replace with a default value if needed
+def _env_int(name: str, default: int = 0) -> int:
+    """Read an integer environment value without crashing on an empty .env entry."""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer.") from exc
+
+
+API_ID = _env_int("API_ID")
+API_HASH = os.getenv("API_HASH", "").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+MONGO_URI = os.getenv("MONGO_URI", "").strip()
+OWNER_ID = _env_int("OWNER_ID")
+
+
+def validate_configuration() -> None:
+    """Fail early with actionable messages when required deployment settings are missing."""
+    missing = [
+        name for name, value in (
+            ("API_ID", API_ID),
+            ("API_HASH", API_HASH),
+            ("BOT_TOKEN", BOT_TOKEN),
+            ("OWNER_ID", OWNER_ID),
+            ("MONGO_URI", MONGO_URI),
+        )
+        if not value
+    ]
+    if missing:
+        raise RuntimeError(
+            "Missing required environment settings: " + ", ".join(missing)
+            + ". Add them to the hosting provider's environment/secrets settings."
+        )
+    if API_ID <= 0 or OWNER_ID <= 0:
+        raise RuntimeError("API_ID and OWNER_ID must be positive integers.")
 
 # Basic Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s')
@@ -96,7 +128,8 @@ except Exception as e:
 
 # --- Global Variables & Bot Initialization ---
 bot_instance: Optional[Client] = None
-db = None  # Database client
+db = None  # Database handle
+mongo_client = None  # Keep the client alive for the lifetime of the bot
 main_event_loop = None # <<< ADD THIS GLOBAL VARIABLE
 users_db = None # Collection for users, roles, basic settings
 quotex_accounts_db = None # Collection for Quotex credentials
@@ -121,22 +154,32 @@ COOLDOWN_MINUTES = 3
 
 # --- Database Setup ---
 async def setup_database():
-    """Initializes MongoDB connection and collections."""
-    global db, users_db, quotex_accounts_db, trade_settings_db
+    """Connects to MongoDB, verifies reachability, and initializes collections."""
+    global db, mongo_client, users_db, quotex_accounts_db, trade_settings_db
     try:
-        client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
-        db = client['quotexTraderBot'] # Database name
-        users_db = db['users']
-        quotex_accounts_db = db['quotex_accounts']
-        trade_settings_db = db['trade_settings']
-        # Create indexes for faster lookups
+        mongo_client = motor.motor_asyncio.AsyncIOMotorClient(
+            MONGO_URI,
+            serverSelectionTimeoutMS=10000,
+            connectTimeoutMS=10000,
+            socketTimeoutMS=20000,
+            retryWrites=True,
+        )
+        # Force an actual connection now so startup errors are reported clearly.
+        await mongo_client.admin.command("ping")
+        db = mongo_client["quotexTraderBot"]
+        users_db = db["users"]
+        quotex_accounts_db = db["quotex_accounts"]
+        trade_settings_db = db["trade_settings"]
         await users_db.create_index("user_id", unique=True)
         await quotex_accounts_db.create_index([("user_id", 1), ("email", 1)], unique=True)
-        await trade_settings_db.create_index("account_doc_id", unique=True) # Link to quotex account document
-        logger.info("Database connection successful and collections initialized.")
-    except Exception as e:
-        logger.error(f"Failed to connect to MongoDB: {e}", exc_info=True)
-        sys.exit(1)
+        await trade_settings_db.create_index("account_doc_id", unique=True)
+        logger.info("MongoDB ping succeeded; collections and indexes are ready.")
+    except Exception:
+        logger.exception("MongoDB connection/setup failed. Check MONGO_URI, network access, and Atlas IP allowlist.")
+        if mongo_client is not None:
+            mongo_client.close()
+            mongo_client = None
+        raise
 
 # --- Database Helper Functions ---
 
@@ -2267,6 +2310,7 @@ async def resume_active_trading_tasks():
 # --- Main Function ---
 async def run_bot():
     global bot_instance, main_event_loop
+    validate_configuration()
     await setup_database()
 
     app = Client(
@@ -2315,6 +2359,12 @@ async def run_bot():
 if __name__ == "__main__":
      # Basic check for config existence might be needed here if not using Env Vars
     print("Starting Quotex Trading Bot...")
+    # Validate required settings before entering the async runtime.
+    try:
+        validate_configuration()
+    except (RuntimeError, ValueError) as config_error:
+        print(f"Configuration error: {config_error}")
+        sys.exit(2)
     # Run the asynchronous main function
     try:
         asyncio.run(run_bot())
