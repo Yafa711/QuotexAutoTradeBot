@@ -14,6 +14,7 @@ import asyncio # Ensure asyncio is imported if not already globally
 from functools import wraps
 from typing import Optional, Dict, Any, Tuple, List
 from dotenv import load_dotenv
+from telegram_signal_bridge import start_signal_listener
 import os
 # --- DNS Resolver Patch ---
 
@@ -134,6 +135,8 @@ main_event_loop = None # <<< ADD THIS GLOBAL VARIABLE
 users_db = None # Collection for users, roles, basic settings
 quotex_accounts_db = None # Collection for Quotex credentials
 trade_settings_db = None # Collection for trade settings per user/account
+signal_queue_db = None # Incoming private Telegram signals
+signal_listener_client = None
 
 # Temporary storage for OTP requests: {user_id: {'qx_client': qx_client_instance, 'event': asyncio.Event()}}
 active_otp_requests: Dict[int, Dict[str, Any]] = {}
@@ -158,7 +161,7 @@ COOLDOWN_MINUTES = 0
 # --- Database Setup ---
 async def setup_database():
     """Connects to MongoDB, verifies reachability, and initializes collections."""
-    global db, mongo_client, users_db, quotex_accounts_db, trade_settings_db
+    global db, mongo_client, users_db, quotex_accounts_db, trade_settings_db, signal_queue_db
     try:
         mongo_client = motor.motor_asyncio.AsyncIOMotorClient(
             MONGO_URI,
@@ -173,6 +176,7 @@ async def setup_database():
         users_db = db["users"]
         quotex_accounts_db = db["quotex_accounts"]
         trade_settings_db = db["trade_settings"]
+        signal_queue_db = db["telegram_signal_queue"]
         await users_db.create_index("user_id", unique=True)
         await quotex_accounts_db.create_index([("user_id", 1), ("email", 1)], unique=True)
         await trade_settings_db.create_index("account_doc_id", unique=True)
@@ -2297,9 +2301,10 @@ async def resume_active_trading_tasks():
 
 # --- Main Function ---
 async def run_bot():
-    global bot_instance, main_event_loop
+    global bot_instance, main_event_loop, signal_listener_client
     validate_configuration()
     await setup_database()
+    signal_listener_client = await start_signal_listener(signal_queue_db)
 
     app = Client(
         "QuotexBot",
@@ -2342,6 +2347,8 @@ async def run_bot():
 
             logger.info("Stopping bot...")
             await app.stop()
+        if signal_listener_client:
+            await signal_listener_client.disconnect()
             logger.info("Bot stopped.")
 
 if __name__ == "__main__":
