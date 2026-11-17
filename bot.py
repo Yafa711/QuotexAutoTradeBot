@@ -2389,7 +2389,7 @@ async def process_telegram_signal(signal_doc, user_id: int, account_doc_id: str)
             if bot_instance:
                 await bot_instance.send_message(user_id,
                     f"Telegram signal result: {outcome.upper()} | {asset_open} {direction.upper()} | "
-                    f"Stake ${{stake:.2f}} | P/L {profit:.2f} | Next ${{next_cents/100:.2f}}")
+                    f"Stake ${stake:.2f} | P/L {profit:.2f} | Next ${next_cents/100:.2f}")
         except Exception as exc:
             logger.exception("Signal execution failed for %s", signal_doc.get("fingerprint"))
             status = "manual_review" if placed else "execution_failed"
