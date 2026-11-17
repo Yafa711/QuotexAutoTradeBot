@@ -23,3 +23,13 @@ services:
         sync: false
       - key: PING_INTERVAL
         value: "20"
+      - key: TELEGRAM_API_ID
+        sync: false
+      - key: TELEGRAM_API_HASH
+        sync: false
+      - key: TELEGRAM_SESSION_STRING
+        sync: false
+      - key: TELEGRAM_TARGET_CHAT
+        value: Eyad Trader Vip
+      - key: SIGNAL_QUOTEX_ACCOUNT_ID
+        sync: false

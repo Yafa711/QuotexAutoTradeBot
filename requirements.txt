@@ -8,3 +8,4 @@ dnspython
 flask
 gunicorn
 requests
+telethon>=1.36,<2
