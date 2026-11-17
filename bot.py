@@ -148,9 +148,12 @@ DEFAULT_TRADE_MODE = "TIMER" # 'TIMER' or 'TIME'
 DEFAULT_CANDLE_SIZE = 60
 DEFAULT_SERVICE_STATUS = False # Trading Off by default
 
+# Fixed one-step progression: $1 -> (after one loss) $2 -> reset to $1.
+BASE_TRADE_AMOUNT = 1.0
+RECOVERY_TRADE_AMOUNT = 2.0
 MARTINGALE_MULTIPLIER = 2.0
-MAX_CONSECUTIVE_LOSSES = 3
-COOLDOWN_MINUTES = 3
+MAX_CONSECUTIVE_LOSSES = 1
+COOLDOWN_MINUTES = 0
 
 # --- Database Setup ---
 async def setup_database():
@@ -598,7 +601,7 @@ async def get_quotex_client(user_id: int, account_doc_id: str, interaction_type:
             # ... (Success logic: log, switch mode, add to cache) ...
             logger.info(f"Quotex connection successful for {email}.")
             settings = await get_or_create_trade_settings(account_doc_id)
-            account_mode = settings.get("account_mode", "PRACTICE")
+            account_mode = "PRACTICE"  # Hard safety lock: this integration never permits REAL accounts.
             try:
                 qx_client.change_account(account_mode)
                 logger.info(f"Switched Quotex account {email} to {account_mode} mode.")
@@ -1989,7 +1992,7 @@ async def run_trading_loop_for_account(user_id: int, account_doc_id: str):
                      break # Break from assets loop for this cycle
 
                  asset_name_original = asset_info.get('name')
-                 base_amount = asset_info.get('amount', DEFAULT_TRADE_AMOUNT)
+                 base_amount = BASE_TRADE_AMOUNT
                  # 'duration' field stores the value used for BOTH timer/time expiry setting
                  duration_or_timeframe_value = asset_info.get('duration', DEFAULT_TRADE_DURATION)
 
@@ -2063,46 +2066,31 @@ async def run_trading_loop_for_account(user_id: int, account_doc_id: str):
 
                            if win_result:
                                 logger.info(f"[{asset_name_open}] Trade Result: WIN! Profit: {profit_or_loss_amount:.2f}")
-                                await bot_instance.send_message(user_id, f"✅ Trade Result: WIN! Profit: {profit_or_loss_amount:.2f}")  
-                                # Reset MTG state for this asset on WIN
-                                asset_mtg['current_amount'] = base_amount
+                                await bot_instance.send_message(user_id, f"✅ Trade Result: WIN! Profit: {profit_or_loss_amount:.2f}")
+                                asset_mtg['current_amount'] = BASE_TRADE_AMOUNT
                                 asset_mtg['consecutive_losses'] = 0
-                                await update_trade_setting(account_doc_id, {
-                                    f"martingale_state.{asset_name_open}.current_amount": asset_mtg['current_amount']
-                                })
-                                await update_trade_setting(account_doc_id, {
-                                    f"martingale_state.{asset_name_open}.consecutive_losses": asset_mtg['consecutive_losses']
-                                })
+                           elif profit_or_loss_amount == 0:
+                                logger.warning(f"[{asset_name_open}] Trade Result: TIE/DOJI.")
+                                await bot_instance.send_message(user_id, "⚠️ Trade Result: TIE/DOJI. Returning stake to $1.")
+                                asset_mtg['current_amount'] = BASE_TRADE_AMOUNT
+                                asset_mtg['consecutive_losses'] = 0
                            else:
-                                if profit_or_loss_amount == 0: # Tie / Doji
-                                    logger.warning(f"[{asset_name_open}] Trade Result: TIE/DOJI.")
-                                    await bot_instance.send_message(user_id, f"⚠️ Trade Result: TIE/DOJI. No profit/loss.")
-                                    # No change in MTG state needed for a tie
-                                else: # Loss
-                                    logger.warning(f"[{asset_name_open}] Trade Result: LOSS! Lost: {abs(profit_or_loss_amount):.2f}")
-                                    await bot_instance.send_message(user_id, f"❌ Trade Result: LOSS! Lost: {abs(profit_or_loss_amount):.2f}")
-                                    asset_mtg['consecutive_losses'] += 1
-                                    # Update consecutive losses in the database for the asset
-                                    await update_trade_setting(account_doc_id, {
-                                        f"martingale_state.{asset_name_open}.consecutive_losses": asset_mtg['consecutive_losses']
-                                    })
-                                    asset_mtg['current_amount'] = round(asset_mtg['current_amount'] * MARTINGALE_MULTIPLIER, 2)
-                                    await update_trade_setting(account_doc_id, {
-                                        f"martingale_state.{asset_name_open}.current_amount": asset_mtg['current_amount']
-                                    })
+                                logger.warning(f"[{asset_name_open}] Trade Result: LOSS! Lost: {abs(profit_or_loss_amount):.2f}")
+                                await bot_instance.send_message(user_id, f"❌ Trade Result: LOSS! Lost: {abs(profit_or_loss_amount):.2f}")
+                                if round(current_trade_amount, 2) == BASE_TRADE_AMOUNT:
+                                    asset_mtg['current_amount'] = RECOVERY_TRADE_AMOUNT
+                                    asset_mtg['consecutive_losses'] = 1
+                                    await bot_instance.send_message(user_id, "↪️ Next stake is $2 (one recovery attempt only).")
+                                else:
+                                    asset_mtg['current_amount'] = BASE_TRADE_AMOUNT
+                                    asset_mtg['consecutive_losses'] = 0
+                                    await bot_instance.send_message(user_id, "↩️ Recovery attempt finished. Stake reset to $1.")
 
-                                    if asset_mtg['consecutive_losses'] >= MAX_CONSECUTIVE_LOSSES:
-                                         logger.warning(f"[{asset_name_open}] Max losses ({MAX_CONSECUTIVE_LOSSES}) reached. Activating {COOLDOWN_MINUTES} min cooldown.")
-                                         active_cooldown_until = time.time() + (COOLDOWN_MINUTES * 60)
-                                         # Reset MTG state for the asset AFTER triggering cooldown
-                                         asset_mtg['current_amount'] = base_amount
-                                         asset_mtg['consecutive_losses'] = 0
-                                         await update_trade_setting(account_doc_id, {
-                                            f"martingale_state.{asset_name_open}.current_amount": asset_mtg['current_amount']
-                                        })
-                                         await update_trade_setting(account_doc_id, {
-                                            f"martingale_state.{asset_name_open}.consecutive_losses": asset_mtg['consecutive_losses']
-                                         })
+                           # Persist the one-step state after every confirmed result.
+                           await update_trade_setting(account_doc_id, {
+                               f"martingale_state.{asset_name_open}.current_amount": asset_mtg['current_amount'],
+                               f"martingale_state.{asset_name_open}.consecutive_losses": asset_mtg['consecutive_losses']
+                           })
 
                       else: # buy status = False
                            buy_error_reason = buy_info if isinstance(buy_info, str) else str(buy_info)
