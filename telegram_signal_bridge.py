@@ -11,17 +11,17 @@ from telethon.sessions import StringSession
 log = logging.getLogger("telegram-signal-bridge")
 SOURCE_TZ = timezone(timedelta(hours=-8), name="UTC-08")
 
-PAIR_RE = re.compile(r"\\b([A-Z]{6}(?:-OTC)?)\\b", re.I)
-ASSET_RE = re.compile(r"(?m)^\\s*[💳📊]\\s*([A-Z0-9][A-Z0-9._/-]*)", re.I)
-TIME_RE = re.compile(r"\\b(\\d{1,2}:\\d{2}(?::\\d{2})?\\s*(?:AM|PM)?)\\b", re.I)
-DURATION_RE = re.compile(r"(?:⌛️?\\s*)?(?:(\\d{1,3})\\s*(?:minutes?|mins?|m)\\b|\\bM(\\d{1,3})\\b)", re.I)
+PAIR_RE = re.compile(r"\b([A-Z]{6}(?:-OTC)?)\b", re.I)
+ASSET_RE = re.compile(r"(?m)^\s*[💳📊]\s*([A-Z0-9][A-Z0-9._/-]*)", re.I)
+TIME_RE = re.compile(r"\b(\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM)?)\b", re.I)
+DURATION_RE = re.compile(r"(?:⌛️?\s*)?(?:(\d{1,3})\s*(?:minutes?|mins?|m)\b|\bM(\d{1,3})\b)", re.I)
 
 def parse_signal(raw):
     text = (raw or "").strip()
     if not text:
         return None
     parts = [p.strip() for p in text.split(";")]
-    if len(parts) >= 4 and re.fullmatch(r"M\\d+", parts[0], re.I):
+    if len(parts) >= 4 and re.fullmatch(r"M\d+", parts[0], re.I):
         pair = PAIR_RE.fullmatch(parts[1])
         direction = parts[3].upper()
         direction = "PUT" if direction in {"PUT", "SELL", "DOWN"} else "CALL" if direction in {"CALL", "BUY", "UP"} else None
@@ -31,7 +31,7 @@ def parse_signal(raw):
             return None
     else:
         pair_match = ASSET_RE.search(text) or PAIR_RE.search(text)
-        direction_match = re.search(r"\\b(PUT|DOWN|SELL|CALL|UP|BUY)\\b", text, re.I)
+        direction_match = re.search(r"\b(PUT|DOWN|SELL|CALL|UP|BUY)\b", text, re.I)
         duration_match = DURATION_RE.search(text)
         time_match = TIME_RE.search(text)
         if not (pair_match and direction_match and duration_match and time_match):
