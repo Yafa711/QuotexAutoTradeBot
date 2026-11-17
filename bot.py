@@ -2204,6 +2204,15 @@ async def run_trading_loop_for_account(user_id: int, account_doc_id: str):
 
 async def start_trading_task(user_id: int, account_doc_id: str):
     """Starts the trading loop task for a given account if not already running."""
+    """Legacy candle-direction trading is disabled; use the Telegram signal worker."""
+    logger.warning("Blocked legacy auto-trading start; Telegram signal execution is the only enabled strategy.")
+    if bot_instance:
+        try:
+            await bot_instance.send_message(user_id, "التداول القديم المعتمد على اتجاه الشمعة معطّل. التنفيذ عبر إشارات Telegram فقط.")
+        except Exception:
+            pass
+    return False
+
     global active_trading_tasks
     # Ensure user is Premium or Sudo if this is a Premium feature
     if not await is_premium_user(user_id):
@@ -2380,7 +2389,7 @@ async def process_telegram_signal(signal_doc, user_id: int, account_doc_id: str)
             if bot_instance:
                 await bot_instance.send_message(user_id,
                     f"Telegram signal result: {outcome.upper()} | {asset_open} {direction.upper()} | "
-                    f"Stake $stake:.2f | P/L {profit:.2f} | Next $next_cents/100:.2f")
+                    f"Stake ${{stake:.2f}} | P/L {profit:.2f} | Next ${{next_cents/100:.2f}}")
         except Exception as exc:
             logger.exception("Signal execution failed for %s", signal_doc.get("fingerprint"))
             status = "manual_review" if placed else "execution_failed"
