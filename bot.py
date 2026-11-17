@@ -86,6 +86,7 @@ API_HASH = os.getenv("API_HASH", "").strip()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 MONGO_URI = os.getenv("MONGO_URI", "").strip()
 OWNER_ID = _env_int("OWNER_ID")
+SIGNAL_QUOTEX_ACCOUNT_ID = os.getenv("SIGNAL_QUOTEX_ACCOUNT_ID", "").strip()
 
 
 def validate_configuration() -> None:
@@ -136,6 +137,10 @@ users_db = None # Collection for users, roles, basic settings
 quotex_accounts_db = None # Collection for Quotex credentials
 trade_settings_db = None # Collection for trade settings per user/account
 signal_queue_db = None # Incoming private Telegram signals
+signal_risk_db = None
+signal_control_db = None
+signal_execution_task = None
+signal_execution_lock = asyncio.Lock()
 signal_listener_client = None
 
 # Temporary storage for OTP requests: {user_id: {'qx_client': qx_client_instance, 'event': asyncio.Event()}}
@@ -161,7 +166,7 @@ COOLDOWN_MINUTES = 0
 # --- Database Setup ---
 async def setup_database():
     """Connects to MongoDB, verifies reachability, and initializes collections."""
-    global db, mongo_client, users_db, quotex_accounts_db, trade_settings_db, signal_queue_db
+    global db, mongo_client, users_db, quotex_accounts_db, trade_settings_db, signal_queue_db, signal_risk_db, signal_control_db
     try:
         mongo_client = motor.motor_asyncio.AsyncIOMotorClient(
             MONGO_URI,
@@ -177,6 +182,9 @@ async def setup_database():
         quotex_accounts_db = db["quotex_accounts"]
         trade_settings_db = db["trade_settings"]
         signal_queue_db = db["telegram_signal_queue"]
+        signal_risk_db = db["telegram_signal_risk"]
+        signal_control_db = db["telegram_signal_control"]
+        await signal_queue_db.create_index([("status", 1), ("entry_at_utc", 1)])
         await users_db.create_index("user_id", unique=True)
         await quotex_accounts_db.create_index([("user_id", 1), ("email", 1)], unique=True)
         await trade_settings_db.create_index("account_doc_id", unique=True)
@@ -2300,8 +2308,128 @@ async def resume_active_trading_tasks():
     logger.info(f"Resumed {count} active trading tasks.")
 
 # --- Main Function ---
+
+async def process_telegram_signal(signal_doc, user_id: int, account_doc_id: str):
+    """Execute one queued Telegram signal on the configured PRACTICE account."""
+    from datetime import datetime, timezone
+    async with signal_execution_lock:
+        now = datetime.now(timezone.utc)
+        entry_at = signal_doc.get("entry_at_utc")
+        if not entry_at or (now - entry_at).total_seconds() > 10:
+            await signal_queue_db.update_one({"_id": signal_doc["_id"], "status": "processing"},
+                {"$set": {"status": "missed", "finished_at_utc": now, "reason": "Entry window expired"}})
+            return
+        settings = await get_or_create_trade_settings(account_doc_id)
+        if settings.get("account_mode", "PRACTICE") != "PRACTICE":
+            await signal_queue_db.update_one({"_id": signal_doc["_id"]},
+                {"$set": {"status": "blocked_non_demo", "finished_at_utc": now}})
+            return
+        risk = await signal_risk_db.find_one({"_id": "telegram_signal_progression"})
+        if not risk:
+            await signal_risk_db.insert_one({"_id": "telegram_signal_progression", "next_stake_cents": 100})
+            risk = {"next_stake_cents": 100}
+        stake = int(risk.get("next_stake_cents", 100)) / 100.0
+        qx_client, status_msg = await get_quotex_client(user_id, account_doc_id, "trading")
+        if not qx_client:
+            await signal_queue_db.update_one({"_id": signal_doc["_id"]},
+                {"$set": {"status": "connection_failed", "reason": str(status_msg), "finished_at_utc": now}})
+            return
+        raw_symbol = str(signal_doc["symbol"]).upper()
+        asset_symbol = raw_symbol.replace("-OTC", "_otc").replace("/", "")
+        asset_open = await _check_asset_open_and_get_name(qx_client, asset_symbol)
+        if not asset_open:
+            await signal_queue_db.update_one({"_id": signal_doc["_id"]},
+                {"$set": {"status": "asset_unavailable", "finished_at_utc": now}})
+            return
+        if (datetime.now(timezone.utc) - entry_at).total_seconds() > 10:
+            await signal_queue_db.update_one({"_id": signal_doc["_id"]},
+                {"$set": {"status": "missed", "finished_at_utc": datetime.now(timezone.utc), "reason": "Late after asset check"}})
+            return
+        duration_seconds = int(signal_doc["duration_minutes"]) * 60
+        direction = str(signal_doc["direction"]).lower()
+        placed = False
+        try:
+            status, buy_info = await qx_client.buy(stake, asset_open, direction, duration_seconds, "TIMER")
+            if not status or not isinstance(buy_info, dict) or not buy_info.get("id"):
+                await signal_queue_db.update_one({"_id": signal_doc["_id"]},
+                    {"$set": {"status": "rejected", "reason": str(buy_info), "finished_at_utc": datetime.now(timezone.utc)}})
+                return
+            placed = True
+            trade_id = buy_info["id"]
+            await signal_queue_db.update_one({"_id": signal_doc["_id"]},
+                {"$set": {"status": "trade_open", "trade_id": str(trade_id), "stake": stake,
+                          "asset_open": asset_open, "direction": direction,
+                          "duration_seconds": duration_seconds, "placed_at_utc": datetime.now(timezone.utc)}})
+            await asyncio.sleep(duration_seconds + 3)
+            win_result = await qx_client.check_win(trade_id)
+            profit = float(qx_client.get_profit() or 0)
+            if win_result:
+                outcome, next_cents = "win", 100
+            elif profit < 0:
+                outcome = "loss"
+                next_cents = 200 if round(stake, 2) == 1.0 else 100
+            else:
+                outcome, next_cents = "tie", 100
+            await signal_risk_db.update_one({"_id": "telegram_signal_progression"},
+                {"$set": {"next_stake_cents": next_cents, "last_result": outcome,
+                          "last_trade_id": str(trade_id), "updated_at_utc": datetime.now(timezone.utc)}},
+                upsert=True)
+            await signal_queue_db.update_one({"_id": signal_doc["_id"], "status": "trade_open"},
+                {"$set": {"status": "completed", "outcome": outcome, "profit": profit,
+                          "next_stake": next_cents / 100.0, "finished_at_utc": datetime.now(timezone.utc)}})
+            if bot_instance:
+                await bot_instance.send_message(user_id,
+                    f"Telegram signal result: {outcome.upper()} | {asset_open} {direction.upper()} | "
+                    f"Stake $stake:.2f | P/L {profit:.2f} | Next $next_cents/100:.2f")
+        except Exception as exc:
+            logger.exception("Signal execution failed for %s", signal_doc.get("fingerprint"))
+            status = "manual_review" if placed else "execution_failed"
+            await signal_queue_db.update_one({"_id": signal_doc["_id"]},
+                {"$set": {"status": status, "reason": str(exc), "finished_at_utc": datetime.now(timezone.utc)}})
+            if placed:
+                await signal_control_db.update_one({"_id": "global"},
+                    {"$set": {"halted": True, "reason": "Trade outcome could not be verified",
+                              "updated_at_utc": datetime.now(timezone.utc)}}, upsert=True)
+                if bot_instance:
+                    await bot_instance.send_message(user_id,
+                        "Stopped automatically: trade result could not be verified. Check Quotex before resuming.")
+
+async def telegram_signal_execution_worker(user_id: int, account_doc_id: str):
+    """Poll queued signals serially; never run the old candle-direction strategy."""
+    from datetime import datetime, timezone, timedelta
+    logger.info("Telegram signal execution worker started in PRACTICE-only mode.")
+    while True:
+        try:
+            control = await signal_control_db.find_one({"_id": "global"}) or {}
+            if control.get("halted"):
+                await asyncio.sleep(5)
+                continue
+            now = datetime.now(timezone.utc)
+            await signal_queue_db.update_many(
+                {"status": "queued", "entry_at_utc": {"$lt": now - timedelta(seconds=10)}},
+                {"$set": {"status": "missed", "finished_at_utc": now, "reason": "Entry time passed"}}
+            )
+            candidate = await signal_queue_db.find_one(
+                {"status": "queued", "entry_at_utc": {"$lte": now, "$gte": now - timedelta(seconds=10)}},
+                sort=[("entry_at_utc", 1)]
+            )
+            if candidate:
+                claimed = await signal_queue_db.update_one(
+                    {"_id": candidate["_id"], "status": "queued"},
+                    {"$set": {"status": "processing", "claimed_at_utc": now}}
+                )
+                if claimed.modified_count:
+                    await process_telegram_signal(candidate, user_id, account_doc_id)
+            else:
+                await asyncio.sleep(0.25)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Telegram signal worker error; retrying safely.")
+            await asyncio.sleep(3)
+
 async def run_bot():
-    global bot_instance, main_event_loop, signal_listener_client
+    global bot_instance, main_event_loop, signal_listener_client, signal_execution_task
     validate_configuration()
     await setup_database()
     signal_listener_client = await start_signal_listener(signal_queue_db)
@@ -2328,8 +2456,15 @@ async def run_bot():
         main_event_loop = asyncio.get_running_loop()
         bot_info = await app.get_me()
         logger.info(f"Bot started as @{bot_info.username} (ID: {bot_info.id})")
-        # Resume trading tasks after bot starts and DB is ready
-        await resume_active_trading_tasks() # Uncomment carefully - ensure loop logic is solid first
+        # Legacy candle-direction trading is intentionally not resumed.
+        if SIGNAL_QUOTEX_ACCOUNT_ID:
+            account_info = await get_quotex_account_details(SIGNAL_QUOTEX_ACCOUNT_ID)
+            if not account_info:
+                raise RuntimeError("SIGNAL_QUOTEX_ACCOUNT_ID does not match a saved Quotex account.")
+            signal_user_id = int(account_info["user_id"])
+            signal_execution_task = asyncio.create_task(telegram_signal_execution_worker(signal_user_id, SIGNAL_QUOTEX_ACCOUNT_ID))
+        else:
+            logger.warning("Signal executor is intake-only until SIGNAL_QUOTEX_ACCOUNT_ID is configured.")
 
         logger.info("Bot is running... Press CTRL+C to stop.")
         # Keep the main thread alive (Pyrogram handles the event loop)
@@ -2347,6 +2482,9 @@ async def run_bot():
 
             logger.info("Stopping bot...")
             await app.stop()
+        if signal_execution_task:
+            signal_execution_task.cancel()
+            await asyncio.gather(signal_execution_task, return_exceptions=True)
         if signal_listener_client:
             await signal_listener_client.disconnect()
             logger.info("Bot stopped.")
